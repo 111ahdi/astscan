@@ -1,0 +1,14 @@
+# IDE
+.vs/
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Environment (contains secrets)
+.env
+
+# Build outputs
+*.exe
