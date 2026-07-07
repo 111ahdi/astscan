@@ -13,8 +13,7 @@ import os
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
-from itertools import groupby
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -43,14 +42,97 @@ MAX_WORKERS = 3
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
-class AllocationInfo:
-    """一次内存分配操作的完整元信息。"""
-    row: int               # 1-based 行号
-    var_name: str          # 指针变量名，未知时为 "?"
-    alloc_text: str        # 分配表达式源码，如 "new int"
-    func_name: str         # 所在函数名，未知时为 "(未知函数)"
-    func_code: str         # 所在函数的完整源码
-    func_id: str           # 唯一函数标识符 "函数名:起始行号"
+class MemoryOp:
+    """单次内存操作（new 或 delete）。"""
+    row: int            # 1-based 行号
+    var_name: str       # 变量名，匿名时为 "?"
+    op_type: str        # "new" | "delete" | "delete[]"
+    op_text: str        # 原始表达式文本，如 "new int[10]" / "delete[] p"
+
+
+@dataclass
+class VariableTrace:
+    """同一变量在函数内的所有内存操作轨迹。"""
+    var_name: str
+    allocs: list[MemoryOp] = field(default_factory=list)   # new 操作
+    deallocs: list[MemoryOp] = field(default_factory=list)  # delete 操作
+
+    @property
+    def is_leaked(self) -> bool:
+        """有 new 但无对应 delete → 泄漏嫌疑。"""
+        return len(self.allocs) > 0 and len(self.deallocs) == 0
+
+    @property
+    def alloc_count(self) -> int:
+        return len(self.allocs)
+
+    @property
+    def dealloc_count(self) -> int:
+        return len(self.deallocs)
+
+
+@dataclass
+class FunctionAnalysis:
+    """一个函数内的完整内存操作分析数据。"""
+    func_name: str
+    func_code: str
+    func_id: str                                # "函数名:起始行"
+    variables: dict[str, VariableTrace] = field(default_factory=dict)
+
+    # ── 工厂方法 ──────────────────────────────────────────────────────────
+
+    def _get_or_create(self, var_name: str) -> VariableTrace:
+        """获取或创建变量的操作轨迹。"""
+        if var_name not in self.variables:
+            self.variables[var_name] = VariableTrace(var_name=var_name)
+        return self.variables[var_name]
+
+    def add_new(self, row: int, var_name: str, op_text: str) -> None:
+        self._get_or_create(var_name).allocs.append(
+            MemoryOp(row=row, var_name=var_name, op_type="new", op_text=op_text)
+        )
+
+    def add_delete(self, row: int, var_name: str, op_text: str) -> None:
+        op_type = "delete[]" if "[" in op_text else "delete"
+        self._get_or_create(var_name).deallocs.append(
+            MemoryOp(row=row, var_name=var_name, op_type=op_type, op_text=op_text)
+        )
+
+    # ── 查询方法 ──────────────────────────────────────────────────────────
+
+    @property
+    def all_ops(self) -> list[MemoryOp]:
+        """返回所有内存操作（按行号排序）。"""
+        ops: list[MemoryOp] = []
+        for v in self.variables.values():
+            ops.extend(v.allocs)
+            ops.extend(v.deallocs)
+        return sorted(ops, key=lambda o: o.row)
+
+    @property
+    def new_ops(self) -> list[MemoryOp]:
+        """返回所有 new 操作（按行号排序）。"""
+        return [op for op in self.all_ops if op.op_type == "new"]
+
+    @property
+    def leaked_vars(self) -> list[VariableTrace]:
+        """返回存在泄漏嫌疑的变量列表。"""
+        return [v for v in self.variables.values() if v.is_leaked]
+
+    @property
+    def safe_vars(self) -> list[VariableTrace]:
+        """返回正确释放的变量列表。"""
+        return [v for v in self.variables.values()
+                if v.alloc_count > 0 and v.dealloc_count > 0]
+
+    @property
+    def orphan_deletes(self) -> list[MemoryOp]:
+        """返回没有对应 new 的 delete（wild pointer / 重复释放）。"""
+        result: list[MemoryOp] = []
+        for v in self.variables.values():
+            if v.alloc_count == 0:
+                result.extend(v.deallocs)
+        return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -76,7 +158,6 @@ def _get_function_name(func_node: Node) -> str:
     for child in func_node.children:
         if child.type == "function_declarator":
             return _find_identifier(child)
-    # 备选：lambda / 匿名函数等情况
     return "(匿名函数)"
 
 
@@ -99,20 +180,24 @@ def get_enclosing_function(node: Node) -> tuple[str | None, str, int]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 核心分析逻辑
+# AST 收集 — 按函数遍历，收集 new 和 delete 操作
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def collect_allocations(
+def collect_memory_ops(
     node: Node,
-    allocations: list[AllocationInfo] | None = None,
-) -> list[AllocationInfo]:
-    """递归遍历 AST，收集所有 new_expression 的元信息。"""
-    if allocations is None:
-        allocations = []
+    ops: list[tuple[str, MemoryOp]] | None = None,
+) -> list[tuple[str, MemoryOp]]:
+    """递归遍历 AST，收集所有 new_expression 和 delete_expression。
 
-    if node.type == "new_expression":
+    返回:
+        (func_id, MemoryOp) 列表，func_id 用于后续按函数分组。
+    """
+    if ops is None:
+        ops = []
+
+    if node.type in ("new_expression", "delete_expression"):
         row = node.start_point.row + 1
-        alloc_text = node.text.decode() if node.text else ""
+        op_text = node.text.decode() if node.text else ""
 
         parent = node.parent
         var_name = _find_identifier(parent) if parent else "?"
@@ -121,64 +206,100 @@ def collect_allocations(
         if func_code is None:
             func_code = "(无法定位所在函数)"
 
-        # 构造唯一函数标识：函数名:函数起始行
         func_id = f"{func_name}:{func_start_row}" if func_name != "(全局作用域)" else "(全局作用域)"
 
-        allocations.append(AllocationInfo(
-            row=row,
-            var_name=var_name,
-            alloc_text=alloc_text,
+        if node.type == "new_expression":
+            op_type = "new"
+        else:
+            op_type = "delete[]" if "[" in op_text else "delete"
+
+        ops.append((
+            func_id,
+            MemoryOp(row=row, var_name=var_name, op_type=op_type, op_text=op_text),
+        ))
+
+    # 不加 else：new 内部可能嵌套 new / delete
+    for child in node.children:
+        collect_memory_ops(child, ops)
+
+    return ops
+
+
+def build_function_analyses(
+    ops: list[tuple[str, MemoryOp]],
+) -> list[FunctionAnalysis]:
+    """将收集到的操作按 func_id 分组，构建 FunctionAnalysis 列表。
+
+    需要同时提供各函数的 func_code。为此重新从 AST 获取 —
+    这里采用一个简化方案：调用方传入完整的树和 ops。
+    """
+    # 按 func_id 分组
+    ops.sort(key=lambda x: x[0])
+    grouped: dict[str, list[MemoryOp]] = {}
+    for func_id, op in ops:
+        grouped.setdefault(func_id, []).append(op)
+
+    results: list[FunctionAnalysis] = []
+    for func_id, op_list in grouped.items():
+        # 从 func_id 提取 func_name（格式: "func_name:start_row"）
+        parts = func_id.rsplit(":", 1)
+        func_name = parts[0]
+
+        # func_code 需要从 AST 重新获取 — 这里用第一个 op 来追溯
+        # 实际场景中可改进为收集阶段一并存储，此处保持简洁
+        func_code = "(函数源码将在分析时获取)"
+
+        fa = FunctionAnalysis(
             func_name=func_name,
             func_code=func_code,
             func_id=func_id,
-        ))
+        )
+        for op in op_list:
+            if op.op_type == "new":
+                fa.add_new(op.row, op.var_name, op.op_text)
+            else:
+                fa.add_delete(op.row, op.var_name, op.op_text)
 
-    # 不加 else：new 内部可能嵌套 new
-    for child in node.children:
-        collect_allocations(child, allocations)
+        results.append(fa)
 
-    return allocations
+    return results
 
 
-def build_prompt(func_code: str, items: list[AllocationInfo]) -> str:
-    """为一个函数内的所有分配点生成一条聚合分析 prompt。"""
-    # 分离有变量名和匿名的分配
-    named = [a for a in items if a.var_name != "?"]
-    anonymous = [a for a in items if a.var_name == "?"]
+# ═══════════════════════════════════════════════════════════════════════════════
+# Prompt 构建
+# ═══════════════════════════════════════════════════════════════════════════════
 
+def build_prompt(fa: FunctionAnalysis) -> str:
+    """为一个函数生成聚合分析 prompt，包含 new 和 delete 的完整信息。"""
     lines: list[str] = []
-    for a in items:
-        if a.var_name != "?":
-            lines.append(
-                f"- 第 {a.row} 行: 指针 **{a.var_name}**, 分配 `{a.alloc_text}`"
-            )
+
+    # ── 列出所有 new 操作 ──────────────────────────────────────────────────
+    for op in fa.new_ops:
+        if op.var_name != "?":
+            lines.append(f"- 第 {op.row} 行: **new** 分配，指针 **{op.var_name}** (`{op.op_text}`)")
         else:
-            lines.append(
-                f"- 第 {a.row} 行: (未绑定变量) 分配 `{a.alloc_text}`"
-            )
+            lines.append(f"- 第 {op.row} 行: **new** 分配，(未绑定变量) (`{op.op_text}`)")
 
-    pointer_names = "、".join(a.var_name for a in named)
+    # ── 列出所有 delete 操作 ───────────────────────────────────────────────
+    for op in fa.all_ops:
+        if op.op_type in ("delete", "delete[]"):
+            lines.append(f"- 第 {op.row} 行: **{op.op_type}** 释放，变量 **{op.var_name}** (`{op.op_text}`)")
 
-    # 构建提示文案
-    if named:
-        main_task = f"逐一判断指针 {pointer_names} 是否存在内存泄漏。"
+    # ── 汇总变量状态 ────────────────────────────────────────────────────────
+    named_all = [op.var_name for op in fa.new_ops if op.var_name != "?"]
+
+    if named_all:
+        main_task = f"逐一判断指针 {'、'.join(named_all)} 是否存在内存泄漏。"
     else:
         main_task = "判断这些分配是否存在内存泄漏。"
 
-    if anonymous:
-        anonymous_note = (
-            "\n注意：存在未绑定变量的内存分配（如作为构造函数参数），"
-            "请根据上下文判断是否需要关注。"
-        )
-    else:
-        anonymous_note = ""
-
+    # ── 构建完整 prompt ────────────────────────────────────────────────────
     return f"""\
 你是一个严格的 C++ 静态分析引擎。
-在下面的 C++ 代码块中，发现了以下内存分配操作：
+在下面的 C++ 代码块中，发现了以下内存操作：
 
 {chr(10).join(lines)}
-{anonymous_note}
+
 请分析该代码块，{main_task}
 
 输出要求：
@@ -192,8 +313,12 @@ def build_prompt(func_code: str, items: list[AllocationInfo]) -> str:
    - 未改动的行不加任何前缀。
 
 待分析代码：
-{func_code}"""
+{fa.func_code}"""
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AI 调用
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def analyze_with_ai(prompt: str, client: OpenAI) -> str:
     """将 prompt 发送给 DeepSeek API，返回模型生成的 Markdown 文本。
@@ -236,14 +361,12 @@ def _render_markdown_with_leak_highlight(md_text: str) -> Text:
     先用 Rich Markdown 完整渲染保留所有样式，再按行拆分，
     对含"泄漏"的行调用 stylize("bold red") 覆盖样式。
     """
-    # ── 第一步：全段 Markdown 渲染 ────────────────────────────────────────────
     segments = list(Markdown(md_text).__rich_console__(console, console.options))
     rendered = Text()
     for seg_text, style, control in segments:
         if not control:
             rendered.append(seg_text, style=style)
 
-    # ── 第二步：按换行定位每一行，标红泄漏行 ──────────────────────────────────
     plain = rendered.plain
     line_start = 0
     for i, ch in enumerate(plain):
@@ -252,20 +375,13 @@ def _render_markdown_with_leak_highlight(md_text: str) -> Text:
             line_text = plain[line_start:line_end]
             if _has_actual_leak(line_text):
                 rendered.stylize("bold red", line_start, line_end)
-            line_start = i + 1  # 跳过换行符
+            line_start = i + 1
 
     return rendered
 
 
 def _render_diff_block(diff_text: str) -> Panel:
-    """将 diff 文本渲染为带颜色背景的 Panel（仿 Claude Code diff 风格）。
-
-    + 开头的行 → 绿底白字（新增）
-    - 开头的行 → 红底白字（删除）
-    @@ 开头的行 → 青色加粗（hunk header）
-    +++ / ---   → 加粗（文件头）
-    其余行       → 保持原样（上下文）
-    """
+    """将 diff 文本渲染为带颜色背景的 Panel（仿 Claude Code diff 风格）。"""
     lines = diff_text.split("\n")
     styled_lines: list[str] = []
 
@@ -285,12 +401,7 @@ def _render_diff_block(diff_text: str) -> Panel:
 
 
 def render_analysis(raw_text: str) -> Panel:
-    """将 AI 返回的 Markdown 渲染为带颜色高亮的 Panel。
-
-    1. 提取 ```diff 代码块，渲染为绿/红底 diff 面板。
-    2. 其余文本用 Markdown 渲染后将泄漏行标红。
-    3. 组装并包裹 Panel。
-    """
+    """将 AI 返回的 Markdown 渲染为带颜色高亮的 Panel。"""
     diff_pattern = re.compile(r"```diff\n(.*?)```", re.DOTALL)
     parts: list = []
     last_end = 0
@@ -362,54 +473,94 @@ def main() -> None:
     code = target_file.read_bytes()
     tree = parser.parse(code)
 
-    # ── 5. 收集所有分配点 ─────────────────────────────────────────────────────
+    # ── 5. 收集所有 new / delete 操作 ─────────────────────────────────────────
     console.print(f"\n[bold]正在扫描: {target_file}[/bold]\n")
-    allocations = collect_allocations(tree.root_node)
+    raw_ops = collect_memory_ops(tree.root_node)
 
-    if not allocations:
-        console.print("[yellow]未发现任何 new 表达式。[/yellow]")
+    if not raw_ops:
+        console.print("[yellow]未发现任何 new / delete 表达式。[/yellow]")
         return
 
-    # ── 6. 按函数分组 ─────────────────────────────────────────────────────────
-    allocations.sort(key=lambda a: a.func_id)
-    groups: list[tuple[str, list[AllocationInfo]]] = [
-        (func_id, list(items))
-        for func_id, items in groupby(allocations, key=lambda a: a.func_id)
-    ]
+    # ── 6. 填充 func_code 并构建 FunctionAnalysis ─────────────────────────────
+    # 重新遍历 AST 获取各函数的源码（比在收集阶段缓存更清晰）
+    _func_code_cache: dict[str, str] = {}
 
+    def _cache_func_codes(node: Node) -> None:
+        if node.type == "function_definition":
+            name = _get_function_name(node)
+            start_row = node.start_point.row + 1
+            fid = f"{name}:{start_row}"
+            if fid not in _func_code_cache:
+                _func_code_cache[fid] = node.text.decode() if node.text else ""
+        for child in node.children:
+            _cache_func_codes(child)
+
+    _cache_func_codes(tree.root_node)
+
+    # 构建 FunctionAnalysis 列表
+    raw_ops.sort(key=lambda x: x[0])
+    analyses: list[FunctionAnalysis] = []
+    current_fa: FunctionAnalysis | None = None
+    current_fid: str | None = None
+
+    for func_id, op in raw_ops:
+        if func_id != current_fid:
+            parts = func_id.rsplit(":", 1)
+            func_name = parts[0]
+            func_code = _func_code_cache.get(func_id, "(无法定位所在函数)")
+            current_fa = FunctionAnalysis(
+                func_name=func_name,
+                func_code=func_code,
+                func_id=func_id,
+            )
+            analyses.append(current_fa)
+            current_fid = func_id
+
+        assert current_fa is not None
+        if op.op_type == "new":
+            current_fa.add_new(op.row, op.var_name, op.op_text)
+        else:
+            current_fa.add_delete(op.row, op.var_name, op.op_text)
+
+    # ── 7. 打印摘要 ───────────────────────────────────────────────────────────
+    total_new = sum(len(fa.new_ops) for fa in analyses)
+    total_delete = sum(
+        len([op for op in fa.all_ops if op.op_type in ("delete", "delete[]")])
+        for fa in analyses
+    )
     console.print(
-        f"[dim]发现 {len(allocations)} 个分配点，"
-        f"分布在 {len(groups)} 个函数中。[/dim]\n"
+        f"[dim]发现 {total_new} 个 new / {total_delete} 个 delete，"
+        f"分布在 {len(analyses)} 个函数中。[/dim]\n"
     )
 
-    # ── 7. 仅收集模式 ─────────────────────────────────────────────────────────
+    # ── 8. 仅收集模式 ─────────────────────────────────────────────────────────
     if args.collect_only:
-        for func_id, items in groups:
-            func_name = items[0].func_name
-            console.print(f"[bold]函数: {func_name}[/bold] ({len(items)} 个分配点)")
-            for a in items:
-                console.print(
-                    f"  第 {a.row} 行: {a.var_name} -> {a.alloc_text}"
-                )
+        for fa in analyses:
+            console.print(f"[bold]函数: {fa.func_name}[/bold]")
+            for op in fa.all_ops:
+                label = {"new": "[cyan]NEW [/cyan]", "delete": "[green]DEL [/green]", "delete[]": "[green]DEL[][/green]"}[op.op_type]
+                console.print(f"  {label} 第 {op.row} 行: {op.var_name} ({op.op_text})")
+            # 泄漏快速判断
+            for v in fa.leaked_vars:
+                console.print(f"  [yellow]  -> {v.var_name}: 可能泄漏（{v.alloc_count} alloc / {v.dealloc_count} dealloc）[/yellow]")
+            for op in fa.orphan_deletes:
+                console.print(f"  [red]  -> {op.var_name}: 无对应 new 的释放！[/red]")
             console.print()
         return
 
-    # ── 8. 调用 AI 分析 ───────────────────────────────────────────────────────
+    # ── 9. 调用 AI 分析 ───────────────────────────────────────────────────────
     client = OpenAI(
         api_key=os.environ["DEEPSEEK_API_KEY"],
         base_url="https://api.deepseek.com",
     )
 
-    # 构建每个函数的 prompt
-    prompts: list[tuple[str, str, list[AllocationInfo]]] = []
-    for func_id, items in groups:
-        func_code = items[0].func_code
-        prompt = build_prompt(func_code, items)
-        prompts.append((func_id, prompt, items))
+    # 构建 prompt 列表（按函数顺序）
+    prompt_list: list[tuple[str, str]] = []
+    for fa in analyses:
+        prompt_list.append((fa.func_id, build_prompt(fa)))
 
-    # 并发调用
+    total = len(prompt_list)
     results: dict[str, str] = {}
-    total = len(prompts)
 
     with Progress(
         SpinnerColumn(),
@@ -422,21 +573,23 @@ def main() -> None:
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             future_map = {
-                executor.submit(analyze_with_ai, prompt, client): (func_id, prompt)
-                for func_id, prompt, _ in prompts
+                executor.submit(analyze_with_ai, prompt, client): func_id
+                for func_id, prompt in prompt_list
             }
 
             for future in as_completed(future_map):
-                func_id, _ = future_map[future]
+                func_id = future_map[future]
                 results[func_id] = future.result()
                 progress.update(task, advance=1)
 
-    # ── 9. 按原顺序渲染结果 ──────────────────────────────────────────────────
-    for func_id, prompt, items in prompts:
+    # ── 10. 按原顺序渲染结果 ──────────────────────────────────────────────────
+    for func_id, _prompt in prompt_list:
         result = results.get(func_id, "")
         if not result:
+            # 找到对应函数名
+            fa_name = next((fa.func_name for fa in analyses if fa.func_id == func_id), func_id)
             console.print(
-                f"[yellow]警告: 函数 {items[0].func_name} 分析失败，已跳过。[/yellow]"
+                f"[yellow]警告: 函数 {fa_name} 分析失败，已跳过。[/yellow]"
             )
             continue
 
