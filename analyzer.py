@@ -548,15 +548,41 @@ def main() -> None:
             console.print()
         return
 
-    # ── 9. 调用 AI 分析 ───────────────────────────────────────────────────────
+    # ── 9. 静态判定：安全函数直接跳过 AI ──────────────────────────────────────
+    safe_funcs: list[FunctionAnalysis] = []
+    needs_ai: list[FunctionAnalysis] = []
+
+    for fa in analyses:
+        has_allocs = len(fa.new_ops) > 0
+        no_leaks = len(fa.leaked_vars) == 0
+        no_orphans = len(fa.orphan_deletes) == 0
+
+        if has_allocs and no_leaks and no_orphans:
+            safe_funcs.append(fa)
+        else:
+            needs_ai.append(fa)
+
+    for fa in safe_funcs:
+        console.print(
+            f"[green][AST 静态确认安全] 函数 {fa.func_name} 内存闭环，无泄漏。"
+            f"（{len(fa.new_ops)} alloc / {sum(v.dealloc_count for v in fa.variables.values())} dealloc）[/green]"
+        )
+
+    if safe_funcs:
+        console.print()
+
+    # ── 10. 仅复杂函数调用 AI 分析 ────────────────────────────────────────────
+    if not needs_ai:
+        console.print("[green]所有函数均为静态安全，无需 AI 分析。[/green]")
+        return
+
     client = OpenAI(
         api_key=os.environ["DEEPSEEK_API_KEY"],
         base_url="https://api.deepseek.com",
     )
 
-    # 构建 prompt 列表（按函数顺序）
     prompt_list: list[tuple[str, str]] = []
-    for fa in analyses:
+    for fa in needs_ai:
         prompt_list.append((fa.func_id, build_prompt(fa)))
 
     total = len(prompt_list)
@@ -582,14 +608,15 @@ def main() -> None:
                 results[func_id] = future.result()
                 progress.update(task, advance=1)
 
-    # ── 10. 按原顺序渲染结果 ──────────────────────────────────────────────────
-    for func_id, _prompt in prompt_list:
-        result = results.get(func_id, "")
+    # ── 11. 按原顺序渲染结果（先安全后 AI）────────────────────────────────────
+    for fa in analyses:
+        if fa in safe_funcs:
+            continue
+
+        result = results.get(fa.func_id, "")
         if not result:
-            # 找到对应函数名
-            fa_name = next((fa.func_name for fa in analyses if fa.func_id == func_id), func_id)
             console.print(
-                f"[yellow]警告: 函数 {fa_name} 分析失败，已跳过。[/yellow]"
+                f"[yellow]警告: 函数 {fa.func_name} 分析失败，已跳过。[/yellow]"
             )
             continue
 
