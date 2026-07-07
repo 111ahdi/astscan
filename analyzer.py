@@ -70,6 +70,15 @@ class VariableTrace:
     def dealloc_count(self) -> int:
         return len(self.deallocs)
 
+    @property
+    def has_mismatch(self) -> bool:
+        """检查是否发生了 new/delete 与 new[]/delete[] 混用。"""
+        if not self.allocs or not self.deallocs:
+            return False
+        alloc_is_array = "[]" in self.allocs[0].op_type
+        dealloc_is_array = "[]" in self.deallocs[0].op_type
+        return alloc_is_array != dealloc_is_array
+
 
 @dataclass
 class FunctionAnalysis:
@@ -87,9 +96,9 @@ class FunctionAnalysis:
             self.variables[var_name] = VariableTrace(var_name=var_name)
         return self.variables[var_name]
 
-    def add_new(self, row: int, var_name: str, op_text: str) -> None:
+    def add_new(self, row: int, var_name: str, op_text: str, op_type: str = "new") -> None:
         self._get_or_create(var_name).allocs.append(
-            MemoryOp(row=row, var_name=var_name, op_type="new", op_text=op_text)
+            MemoryOp(row=row, var_name=var_name, op_type=op_type, op_text=op_text)
         )
 
     def add_delete(self, row: int, var_name: str, op_text: str) -> None:
@@ -112,7 +121,7 @@ class FunctionAnalysis:
     @property
     def new_ops(self) -> list[MemoryOp]:
         """返回所有 new 操作（按行号排序）。"""
-        return [op for op in self.all_ops if op.op_type == "new"]
+        return [op for op in self.all_ops if op.op_type in ("new", "new[]")]
 
     @property
     def leaked_vars(self) -> list[VariableTrace]:
@@ -209,7 +218,7 @@ def collect_memory_ops(
         func_id = f"{func_name}:{func_start_row}" if func_name != "(全局作用域)" else "(全局作用域)"
 
         if node.type == "new_expression":
-            op_type = "new"
+            op_type = "new[]" if "[" in op_text else "new"
         else:
             op_type = "delete[]" if "[" in op_text else "delete"
 
@@ -255,7 +264,7 @@ def build_function_analyses(
             func_id=func_id,
         )
         for op in op_list:
-            if op.op_type == "new":
+            if op.op_type in ("new", "new[]"):
                 fa.add_new(op.row, op.var_name, op.op_text)
             else:
                 fa.add_delete(op.row, op.var_name, op.op_text)
@@ -517,8 +526,8 @@ def main() -> None:
             current_fid = func_id
 
         assert current_fa is not None
-        if op.op_type == "new":
-            current_fa.add_new(op.row, op.var_name, op.op_text)
+        if op.op_type in ("new", "new[]"):
+            current_fa.add_new(op.row, op.var_name, op.op_text, op.op_type)
         else:
             current_fa.add_delete(op.row, op.var_name, op.op_text)
 
@@ -538,7 +547,10 @@ def main() -> None:
         for fa in analyses:
             console.print(f"[bold]函数: {fa.func_name}[/bold]")
             for op in fa.all_ops:
-                label = {"new": "[cyan]NEW [/cyan]", "delete": "[green]DEL [/green]", "delete[]": "[green]DEL[][/green]"}[op.op_type]
+                label = {
+                    "new": "[cyan]NEW  [/cyan]", "new[]": "[cyan]NEW[][/cyan]",
+                    "delete": "[green]DEL  [/green]", "delete[]": "[green]DEL[][/green]",
+                }[op.op_type]
                 console.print(f"  {label} 第 {op.row} 行: {op.var_name} ({op.op_text})")
             # 泄漏快速判断
             for v in fa.leaked_vars:
@@ -548,32 +560,60 @@ def main() -> None:
             console.print()
         return
 
-    # ── 9. 静态判定：安全函数直接跳过 AI ──────────────────────────────────────
-    safe_funcs: list[FunctionAnalysis] = []
-    needs_ai: list[FunctionAnalysis] = []
+    # ── 9. 静态判定：三层分流 ──────────────────────────────────────────────────
+    safe_funcs: list[FunctionAnalysis] = []       # 内存闭环，无泄漏
+    mismatch_funcs: list[tuple[FunctionAnalysis, list[VariableTrace]]] = []  # 交叉释放
+    needs_ai: list[FunctionAnalysis] = []          # 疑似泄漏，需 AI 深度分析
 
     for fa in analyses:
         has_allocs = len(fa.new_ops) > 0
-        no_leaks = len(fa.leaked_vars) == 0
-        no_orphans = len(fa.orphan_deletes) == 0
+        has_mismatches = any(v.has_mismatch for v in fa.variables.values())
+        has_leaks = len(fa.leaked_vars) > 0 or len(fa.orphan_deletes) > 0
 
-        if has_allocs and no_leaks and no_orphans:
+        # 交叉释放 → 本地报致命错误（可与其他层级并存）
+        if has_mismatches:
+            mismatched_vars = [v for v in fa.variables.values() if v.has_mismatch]
+            mismatch_funcs.append((fa, mismatched_vars))
+
+        if not has_allocs:
+            continue
+
+        if not has_mismatches and not has_leaks:
+            # 内存完全闭环 → 安全
             safe_funcs.append(fa)
-        else:
+        elif has_leaks:
+            # 存在泄漏嫌疑 → 交给 AI（即使同时有 mismatch，leak 部分仍需 AI）
             needs_ai.append(fa)
 
+    # ── 打印安全函数 ──────────────────────────────────────────────────────────
     for fa in safe_funcs:
         console.print(
             f"[green][AST 静态确认安全] 函数 {fa.func_name} 内存闭环，无泄漏。"
             f"（{len(fa.new_ops)} alloc / {sum(v.dealloc_count for v in fa.variables.values())} dealloc）[/green]"
         )
-
     if safe_funcs:
         console.print()
 
-    # ── 10. 仅复杂函数调用 AI 分析 ────────────────────────────────────────────
+    # ── 打印致命错误（交叉释放）─────────────────────────────────────────────────
+    for fa, mismatched in mismatch_funcs:
+        for v in mismatched:
+            alloc_op = v.allocs[0]
+            dealloc_op = v.deallocs[0]
+            console.print(
+                f"[red][致命错误] 函数 {fa.func_name} 指针 {v.var_name} "
+                f"分配为 {alloc_op.op_type}（{alloc_op.op_text}），"
+                f"却使用 {dealloc_op.op_type}（{dealloc_op.op_text}）释放！"
+                f"（第 {alloc_op.row} 行分配，第 {dealloc_op.row} 行释放）[/red]"
+            )
+    if mismatch_funcs:
+        console.print()
+
+    # ── 10. 仅疑难杂症调用 AI 分析 ────────────────────────────────────────────
     if not needs_ai:
-        console.print("[green]所有函数均为静态安全，无需 AI 分析。[/green]")
+        if mismatch_funcs:
+            console.print("[yellow]所有问题已在本地判定（交叉释放），无需 AI 分析。[/yellow]")
+        else:
+            console.print("[green]所有函数均为静态安全，无需 AI 分析。[/green]")
         return
 
     client = OpenAI(
@@ -608,9 +648,10 @@ def main() -> None:
                 results[func_id] = future.result()
                 progress.update(task, advance=1)
 
-    # ── 11. 按原顺序渲染结果（先安全后 AI）────────────────────────────────────
+    # ── 11. 按原顺序渲染 AI 结果（安全函数已本地处理）─────────────────────────
+    safe_fa_ids = {fa.func_id for fa in safe_funcs}
     for fa in analyses:
-        if fa in safe_funcs:
+        if fa.func_id in safe_fa_ids:
             continue
 
         result = results.get(fa.func_id, "")
