@@ -621,7 +621,8 @@ def main() -> None:
             mismatched_vars = [v for v in fa.variables.values() if v.has_mismatch]
             mismatch_funcs.append((fa, mismatched_vars))
 
-        if not has_allocs:
+        if not has_allocs and not has_leaks:
+            # 没有任何内存操作 → 跳过（理论上不会出现）
             continue
 
         if not has_mismatches and not has_leaks:
