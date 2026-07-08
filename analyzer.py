@@ -4,7 +4,7 @@
     python analyzer.py [target_file] [--collect-only]
 
 选项:
-    target_path      要分析的 C++ 文件或项目文件夹路径（默认当前目录 '.'）
+    target_path      要分析的 C++ 文件或项目文件夹路径（默认 test.cpp）
     --collect-only   仅收集并打印分配点，不调用 AI
 """
 
@@ -238,9 +238,7 @@ def collect_memory_ops(
         parent = node.parent
         var_name = _find_identifier(parent) if parent else "?"
 
-        func_code, func_name, func_start_row = get_enclosing_function(node)
-        if func_code is None:
-            func_code = "(无法定位所在函数)"
+        _, func_name, func_start_row = get_enclosing_function(node)
 
         # func_id 包含文件路径，确保跨文件唯一
         scope = file_path if file_path else "(全局作用域)"
@@ -261,46 +259,6 @@ def collect_memory_ops(
         collect_memory_ops(child, ops)
 
     return ops
-
-
-def build_function_analyses(
-    ops: list[tuple[str, MemoryOp]],
-) -> list[FunctionAnalysis]:
-    """将收集到的操作按 func_id 分组，构建 FunctionAnalysis 列表。
-
-    需要同时提供各函数的 func_code。为此重新从 AST 获取 —
-    这里采用一个简化方案：调用方传入完整的树和 ops。
-    """
-    # 按 func_id 分组
-    ops.sort(key=lambda x: x[0])
-    grouped: dict[str, list[MemoryOp]] = {}
-    for func_id, op in ops:
-        grouped.setdefault(func_id, []).append(op)
-
-    results: list[FunctionAnalysis] = []
-    for func_id, op_list in grouped.items():
-        # 从 func_id 提取 func_name（格式: "func_name:start_row"）
-        parts = func_id.rsplit(":", 1)
-        func_name = parts[0]
-
-        # func_code 需要从 AST 重新获取 — 这里用第一个 op 来追溯
-        # 实际场景中可改进为收集阶段一并存储，此处保持简洁
-        func_code = "(函数源码将在分析时获取)"
-
-        fa = FunctionAnalysis(
-            func_name=func_name,
-            func_code=func_code,
-            func_id=func_id,
-        )
-        for op in op_list:
-            if op.op_type in ("new", "new[]"):
-                fa.add_new(op.row, op.var_name, op.op_text)
-            else:
-                fa.add_delete(op.row, op.var_name, op.op_text)
-
-        results.append(fa)
-
-    return results
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -494,7 +452,7 @@ def _parse_args() -> argparse.Namespace:
         "target_path",
         nargs="?",
         default="test.cpp",
-        help="要分析的 C++ 文件或项目文件夹路径（默认当前目录 '.'）",
+        help="要分析的 C++ 文件或项目文件夹路径（默认 test.cpp）",
     )
     parser.add_argument(
         "--collect-only",
@@ -648,7 +606,7 @@ def main() -> None:
             console.print()
         return
 
-    # ── 9. 静态判定：三层分流 ──────────────────────────────────────────────────
+    # ── 8. 静态判定：三层分流 ──────────────────────────────────────────────────
     safe_funcs: list[FunctionAnalysis] = []       # 内存闭环，无泄漏
     mismatch_funcs: list[tuple[FunctionAnalysis, list[VariableTrace]]] = []  # 交叉释放
     needs_ai: list[FunctionAnalysis] = []          # 疑似泄漏，需 AI 深度分析
@@ -696,7 +654,7 @@ def main() -> None:
     if mismatch_funcs:
         console.print()
 
-    # ── 10. 仅疑难杂症调用 AI 分析 ────────────────────────────────────────────
+    # ── 9. 仅疑难杂症调用 AI 分析 ────────────────────────────────────────────
     if not needs_ai:
         if mismatch_funcs:
             console.print("[yellow]所有问题已在本地判定（交叉释放），无需 AI 分析。[/yellow]")
@@ -738,10 +696,11 @@ def main() -> None:
                 results[func_id] = future.result()
                 progress.update(task, advance=1)
 
-    # ── 11. 按原顺序渲染 AI 结果（安全函数已本地处理）─────────────────────────
-    safe_fa_ids = {fa.func_id for fa in safe_funcs}
+    # ── 10. 按原顺序渲染 AI 结果（安全/纯交叉释放函数已本地处理）──────────────
+    skip_ids = {fa.func_id for fa in safe_funcs}
+    skip_ids.update(fa.func_id for fa, _ in mismatch_funcs if fa not in needs_ai)
     for fa in analyses:
-        if fa.func_id in safe_fa_ids:
+        if fa.func_id in skip_ids:
             continue
 
         result = results.get(fa.func_id, "")
