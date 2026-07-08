@@ -4,7 +4,7 @@
     python analyzer.py [target_file] [--collect-only]
 
 选项:
-    target_file      要分析的 C++ 文件或项目文件夹路径（默认当前目录 '.'）
+    target_path      要分析的 C++ 文件或项目文件夹路径（默认当前目录 '.'）
     --collect-only   仅收集并打印分配点，不调用 AI
 """
 
@@ -163,11 +163,32 @@ def _find_identifier(node: Node) -> str:
 
 
 def _get_function_name(func_node: Node) -> str:
-    """从 function_definition 节点中提取函数名。"""
-    for child in func_node.children:
-        if child.type == "function_declarator":
-            return _find_identifier(child)
-    return "(匿名函数)"
+    """从 function_definition 节点中提取函数名。
+
+    注意：function_declarator 可能被 pointer_declarator / reference_declarator 包裹
+    （如 int* func() 或 int& func()），需要递归查找。
+    """
+    def _search(node: Node) -> str:
+        if node.type == "function_declarator":
+            return _find_identifier(node)
+        for child in node.children:
+            result = _search(child)
+            if result != "?":
+                return result
+        return "?"
+    return _search(func_node)
+
+
+def _collect_callees(node: Node, result: set[str]) -> None:
+    """递归遍历子树，收集所有 call_expression 中被调用的函数名。"""
+    if node.type == "call_expression":
+        func_node = node.child_by_field_name("function")
+        if func_node is not None:
+            name = _find_identifier(func_node)
+            if name != "?":
+                result.add(name)
+    for child in node.children:
+        _collect_callees(child, result)
 
 
 def get_enclosing_function(node: Node) -> tuple[str | None, str, int]:
@@ -286,8 +307,18 @@ def build_function_analyses(
 # Prompt 构建
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def build_prompt(fa: FunctionAnalysis) -> str:
-    """为一个函数生成聚合分析 prompt，包含 new 和 delete 的完整信息。"""
+def build_prompt(
+    fa: FunctionAnalysis,
+    global_functions: dict[str, str] | None = None,
+    func_callees: dict[str, set[str]] | None = None,
+) -> str:
+    """为一个函数生成聚合分析 prompt。
+
+    参数:
+        fa:              当前函数的分析数据。
+        global_functions: 纯函数名 → 函数源码（跨文件全局映射）。
+        func_callees:     func_id → 该函数内部调用的函数名集合。
+    """
     lines: list[str] = []
 
     # ── 列出所有 new 操作 ──────────────────────────────────────────────────
@@ -310,6 +341,17 @@ def build_prompt(fa: FunctionAnalysis) -> str:
     else:
         main_task = "判断这些分配是否存在内存泄漏。"
 
+    # ── 关联函数参考 ────────────────────────────────────────────────────────
+    reference_block = ""
+    if global_functions and func_callees:
+        callees = func_callees.get(fa.func_id, set())
+        related = [fn for fn in callees if fn in global_functions]
+        if related:
+            reference_lines: list[str] = []
+            for fn in related:
+                reference_lines.append(f"\n### {fn}\n```cpp\n{global_functions[fn]}\n```")
+            reference_block = "\n## 关联函数的源码（供参考）\n" + "\n".join(reference_lines)
+
     # ── 构建完整 prompt ────────────────────────────────────────────────────
     return f"""\
 你是一个严格的 C++ 静态分析引擎。
@@ -330,7 +372,7 @@ def build_prompt(fa: FunctionAnalysis) -> str:
    - 未改动的行不加任何前缀。
 
 待分析代码：
-{fa.func_code}"""
+{fa.func_code}{reference_block}"""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -507,31 +549,40 @@ def main() -> None:
 
     # ── 4. 跨文件收集所有 new / delete 操作 ───────────────────────────────────
     all_raw_ops: list[tuple[str, MemoryOp]] = []
-    # 缓存函数源码：key = func_id，value = func_code
-    func_code_cache: dict[str, str] = {}
+    func_code_cache: dict[str, str] = {}          # func_id → 函数源码
+    func_callees: dict[str, set[str]] = {}        # func_id → 该函数内部调用的函数名集合
+    global_functions: dict[str, str] = {}          # 纯函数名 → 函数源码（同名后者覆盖）
+
+    def _cache_functions(tree_root: Node, file_path_str: str) -> None:
+        """遍历 AST，缓存函数源码、被调用函数名，并更新全局函数映射。"""
+        for node in tree_root.children:
+            _cache_functions(node, file_path_str)  # 先递归子节点
+            if node.type == "function_definition":
+                name = _get_function_name(node)
+                start_row = node.start_point.row + 1
+                fid = f"{file_path_str}:{name}:{start_row}"
+                func_code = node.text.decode() if node.text else ""
+
+                if fid not in func_code_cache:
+                    func_code_cache[fid] = func_code
+                # 记录当前函数内调用过哪些函数
+                callees: set[str] = set()
+                _collect_callees(node, callees)
+                func_callees[fid] = callees
+                # 纯函数名 → 源码（方便跨文件按函数名检索）
+                if name not in ("(匿名函数)", "(全局作用域)"):
+                    global_functions[name] = func_code
 
     for file_path in source_files:
         console.print(f"[dim]  扫描: {file_path}[/dim]")
 
-        # 读取并解析
         code = file_path.read_bytes()
         tree = parser.parse(code)
 
-        # 收集内存操作（file_path 确保跨文件 func_id 唯一）
         file_ops = collect_memory_ops(tree.root_node, file_path=str(file_path))
         all_raw_ops.extend(file_ops)
 
-        # 缓存该文件的函数源码
-        def _cache(node: Node) -> None:
-            if node.type == "function_definition":
-                name = _get_function_name(node)
-                start_row = node.start_point.row + 1
-                fid = f"{file_path}:{name}:{start_row}"
-                if fid not in func_code_cache:
-                    func_code_cache[fid] = node.text.decode() if node.text else ""
-            for child in node.children:
-                _cache(child)
-        _cache(tree.root_node)
+        _cache_functions(tree.root_node, str(file_path))
 
     if not all_raw_ops:
         console.print("[yellow]未发现任何 new / delete 表达式。[/yellow]")
@@ -660,7 +711,9 @@ def main() -> None:
 
     prompt_list: list[tuple[str, str]] = []
     for fa in needs_ai:
-        prompt_list.append((fa.func_id, build_prompt(fa)))
+        prompt_list.append(
+            (fa.func_id, build_prompt(fa, global_functions, func_callees))
+        )
 
     total = len(prompt_list)
     results: dict[str, str] = {}
