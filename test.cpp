@@ -9,6 +9,7 @@ int main() {
     p3 = new int;             // assignment_expression 场景
 
     delete p1;
+    delete p2;
 
     return 0;
 }

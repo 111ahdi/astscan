@@ -101,8 +101,10 @@ class FunctionAnalysis:
             MemoryOp(row=row, var_name=var_name, op_type=op_type, op_text=op_text)
         )
 
-    def add_delete(self, row: int, var_name: str, op_text: str) -> None:
-        op_type = "delete[]" if "[" in op_text else "delete"
+    def add_delete(self, row: int, var_name: str, op_text: str,
+                   op_type: str | None = None) -> None:
+        if op_type is None:
+            op_type = "delete[]" if "[" in op_text else "delete"
         self._get_or_create(var_name).deallocs.append(
             MemoryOp(row=row, var_name=var_name, op_type=op_type, op_text=op_text)
         )
@@ -144,6 +146,16 @@ class FunctionAnalysis:
         return result
 
 
+@dataclass
+class ClassInfo:
+    """类级别信息，用于跨成员函数追踪成员变量的分配/释放配对。"""
+    class_name: str
+    member_vars: set[str] = field(default_factory=set)    # 成员变量名集合
+    method_ids: list[str] = field(default_factory=list)    # 归属该类的 func_id 列表
+    ctor_ids: list[str] = field(default_factory=list)      # 构造函数 func_id
+    dtor_ids: list[str] = field(default_factory=list)      # 析构函数 func_id
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # AST 辅助工具
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -167,9 +179,25 @@ def _get_function_name(func_node: Node) -> str:
 
     注意：function_declarator 可能被 pointer_declarator / reference_declarator 包裹
     （如 int* func() 或 int& func()），需要递归查找。
+    同时处理析构函数名（~ClassName）。
     """
+    def _find_dtor_name(node: Node) -> Node | None:
+        """在子树中递归查找 destructor_name 节点。"""
+        if node.type == "destructor_name":
+            return node
+        for child in node.children:
+            result = _find_dtor_name(child)
+            if result:
+                return result
+        return None
+
     def _search(node: Node) -> str:
         if node.type == "function_declarator":
+            # 优先检测析构函数（~ClassName）
+            dtor = _find_dtor_name(node)
+            if dtor:
+                ident = _find_identifier(dtor)
+                return f"~{ident}" if ident != "?" else "?"
             return _find_identifier(node)
         for child in node.children:
             result = _search(child)
@@ -177,6 +205,47 @@ def _get_function_name(func_node: Node) -> str:
                 return result
         return "?"
     return _search(func_node)
+
+
+def _resolve_method_class(func_node: Node) -> tuple[str | None, str, bool, bool]:
+    """判断函数是否属于某个类。
+
+    返回:
+        (class_name, short_func_name, is_constructor, is_destructor)
+        class_name 为 None 表示自由函数。
+
+    支持两种形式：
+    1. 行内定义 — function_definition 直接嵌套在 class_specifier 内
+    2. 行外定义 — 如 Player::Player()、Player::~Player()
+    """
+    # 情况 1：行内成员函数（父级链包含 class_specifier / struct_specifier）
+    cursor = func_node.parent
+    while cursor is not None:
+        if cursor.type in ("class_specifier", "struct_specifier"):
+            name_node = cursor.child_by_field_name("name")
+            class_name = name_node.text.decode() if name_node and name_node.text else "?"
+            short_name = _get_function_name(func_node)
+            is_dtor = short_name.startswith("~")
+            is_ctor = (short_name == class_name)
+            return class_name, short_name, is_ctor, is_dtor
+        cursor = cursor.parent
+
+    # 情况 2：行外定义 — 通过 function_declarator 中的 :: 识别
+    for child in func_node.children:
+        if child.type == "function_declarator":
+            decl_text = child.text.decode() if child.text else ""
+            paren = decl_text.find("(")
+            name_part = decl_text[:paren] if paren != -1 else decl_text.strip()
+            if "::" in name_part:
+                parts = name_part.split("::")
+                class_name = parts[0].strip()
+                short_name = parts[1].strip() if len(parts) > 1 else ""
+                is_dtor = short_name.startswith("~")
+                is_ctor = (short_name == class_name)
+                return class_name, short_name, is_ctor, is_dtor
+            break  # 只检查第一个 function_declarator
+
+    return None, _get_function_name(func_node), False, False
 
 
 def _collect_callees(node: Node, result: set[str]) -> None:
@@ -189,6 +258,57 @@ def _collect_callees(node: Node, result: set[str]) -> None:
                 result.add(name)
     for child in node.children:
         _collect_callees(child, result)
+
+
+def _collect_class_definitions(tree_root: Node) -> dict[str, ClassInfo]:
+    """遍历 AST 收集所有 class_specifier，提取成员变量声明。"""
+    classes: dict[str, ClassInfo] = {}
+
+    def _extract_fields(body_node: Node, info: ClassInfo) -> None:
+        """从类体中递归提取 field_declaration 的变量名。
+
+        跳过函数声明（function_declarator），只收集真正的成员变量。
+        """
+        def _find_field_name(decl_node: Node) -> str:
+            """在 declarator 子树中递归查找 field_identifier。"""
+            if decl_node.type in ("field_identifier", "identifier"):
+                return decl_node.text.decode() if decl_node.text else "?"
+            for c in decl_node.children:
+                result = _find_field_name(c)
+                if result and result != "?":
+                    return result
+            return ""
+
+        for child in body_node.children:
+            if child.type == "field_declaration":
+                # 跳过函数声明（构造/析构/成员函数）
+                if any(c.type == "function_declarator"
+                       for c in child.children):
+                    pass  # 函数声明，不提取
+                else:
+                    decl = child.child_by_field_name("declarator")
+                    if decl:
+                        name = _find_field_name(decl)
+                        if name:
+                            info.member_vars.add(name)
+            if child.child_count > 0:
+                _extract_fields(child, info)
+
+    def _scan(node: Node) -> None:
+        if node.type in ("class_specifier", "struct_specifier"):
+            name_node = node.child_by_field_name("name")
+            class_name = name_node.text.decode() if name_node and name_node.text else None
+            if class_name:
+                info = ClassInfo(class_name=class_name)
+                body = node.child_by_field_name("body")
+                if body:
+                    _extract_fields(body, info)
+                classes[class_name] = info
+        for child in node.children:
+            _scan(child)
+
+    _scan(tree_root)
+    return classes
 
 
 def get_enclosing_function(node: Node) -> tuple[str | None, str, int]:
@@ -262,6 +382,77 @@ def collect_memory_ops(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# 类级别跨函数合并
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _merge_class_level_traces(
+    analyses: list[FunctionAnalysis],
+    class_defs: dict[str, ClassInfo],
+) -> None:
+    """对每个类，将成员变量的 alloc/dealloc 跨成员函数配对。
+
+    若成员变量 data 在构造函数中 new，在析构函数中 delete，
+    则在构造函数中补充"虚拟 dealloc"，在析构函数中补充"虚拟 alloc"，
+    使各自的 VariableTrace 恢复平衡（is_leaked=False, orphan_deletes 消失）。
+    """
+    fa_map: dict[str, FunctionAnalysis] = {fa.func_id: fa for fa in analyses}
+
+    for _cls_name, info in class_defs.items():
+        if not info.method_ids:
+            continue
+
+        for var_name in info.member_vars:
+            all_allocs: list[tuple[str, MemoryOp]] = []     # (func_id, MemoryOp)
+            all_deallocs: list[tuple[str, MemoryOp]] = []
+
+            for fid in info.method_ids:
+                fa = fa_map.get(fid)
+                if not fa or var_name not in fa.variables:
+                    continue
+                trace = fa.variables[var_name]
+                for op in trace.allocs:
+                    all_allocs.append((fid, op))
+                for op in trace.deallocs:
+                    all_deallocs.append((fid, op))
+
+            # 仅当跨函数同时存在 alloc 和 dealloc 时才处理
+            if not all_allocs or not all_deallocs:
+                continue
+
+            # ── 配对规则：至少一端必须是 ctor 或 dtor ──
+            # ctor 分配但 dtor 未释放 → 真正的泄漏，不做跨函数配对
+            alloc_funcs = {fid for fid, _ in all_allocs}
+            dealloc_funcs = {fid for fid, _ in all_deallocs}
+            has_ctor_alloc = bool(alloc_funcs & set(info.ctor_ids))
+            has_dtor_dealloc = bool(dealloc_funcs & set(info.dtor_ids))
+
+            if has_ctor_alloc and not has_dtor_dealloc:
+                # 构造函数分配了，但析构函数没释放 → 潜在泄漏，不配对
+                continue
+            if not has_ctor_alloc and not has_dtor_dealloc:
+                # 两端都是普通成员函数 → 不确定性太高，不配对
+                continue
+
+            # 在 alloc 所在函数中补充虚拟 dealloc（类型匹配）
+            for fid, alloc_op in all_allocs:
+                fa = fa_map.get(fid)
+                if fa:
+                    matched_del = "delete[]" if alloc_op.op_type == "new[]" else "delete"
+                    fa.add_delete(alloc_op.row, var_name,
+                                  f"(跨函数: 由其他成员函数 {matched_del} 释放)",
+                                  op_type=matched_del)
+
+            # 在 dealloc 所在函数中补充虚拟 alloc（类型匹配）
+            for fid, dealloc_op in all_deallocs:
+                fa = fa_map.get(fid)
+                if fa:
+                    matched_new = "new[]" if dealloc_op.op_type == "delete[]" else "new"
+                    fa.add_new(dealloc_op.row, var_name,
+                               f"(跨函数: 由其他成员函数 {matched_new} 分配)",
+                               op_type=matched_new)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Prompt 构建
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -269,6 +460,9 @@ def build_prompt(
     fa: FunctionAnalysis,
     global_functions: dict[str, str] | None = None,
     func_callees: dict[str, set[str]] | None = None,
+    func_class_map: dict[str, str] | None = None,
+    class_defs: dict[str, ClassInfo] | None = None,
+    func_code_cache: dict[str, str] | None = None,
 ) -> str:
     """为一个函数生成聚合分析 prompt。
 
@@ -276,19 +470,27 @@ def build_prompt(
         fa:              当前函数的分析数据。
         global_functions: 纯函数名 → 函数源码（跨文件全局映射）。
         func_callees:     func_id → 该函数内部调用的函数名集合。
+        func_class_map:   func_id → 类名（用于跨函数分析）。
+        class_defs:       类名 → ClassInfo（成员变量和方法列表）。
+        func_code_cache:  func_id → 函数源码。
     """
     lines: list[str] = []
 
     # ── 列出所有 new 操作 ──────────────────────────────────────────────────
     for op in fa.new_ops:
+        if op.op_text.startswith("(跨函数:"):
+            continue  # 虚拟操作（跨函数配对），不展示给 AI
+        kind = "new[]" if op.op_type == "new[]" else "new"
         if op.var_name != "?":
-            lines.append(f"- 第 {op.row} 行: **new** 分配，指针 **{op.var_name}** (`{op.op_text}`)")
+            lines.append(f"- 第 {op.row} 行: **{kind}** 分配，指针 **{op.var_name}** (`{op.op_text}`)")
         else:
-            lines.append(f"- 第 {op.row} 行: **new** 分配，(未绑定变量) (`{op.op_text}`)")
+            lines.append(f"- 第 {op.row} 行: **{kind}** 分配，(未绑定变量) (`{op.op_text}`)")
 
     # ── 列出所有 delete 操作 ───────────────────────────────────────────────
     for op in fa.all_ops:
         if op.op_type in ("delete", "delete[]"):
+            if op.op_text.startswith("(跨函数:"):
+                continue  # 虚拟操作（跨函数配对），不展示给 AI
             lines.append(f"- 第 {op.row} 行: **{op.op_type}** 释放，变量 **{op.var_name}** (`{op.op_text}`)")
 
     # ── 汇总变量状态 ────────────────────────────────────────────────────────
@@ -310,6 +512,28 @@ def build_prompt(
                 reference_lines.append(f"\n### {fn}\n```cpp\n{global_functions[fn]}\n```")
             reference_block = "\n## 关联函数的源码（供参考）\n" + "\n".join(reference_lines)
 
+    # ── 同类成员函数参考 ───────────────────────────────────────────────────
+    class_block = ""
+    if func_class_map and class_defs and func_code_cache:
+        cls_name = func_class_map.get(fa.func_id)
+        if cls_name:
+            info = class_defs.get(cls_name)
+            if info:
+                peers = [fid for fid in info.method_ids
+                         if fid != fa.func_id and fid in func_code_cache]
+                if peers:
+                    peer_lines: list[str] = []
+                    for fid in peers:
+                        parts = fid.rsplit(":", 2)
+                        peer_name = parts[-2] if len(parts) >= 2 else fid
+                        peer_lines.append(
+                            f"\n### {peer_name} (同类 {cls_name})\n```cpp\n{func_code_cache[fid]}\n```"
+                        )
+                    class_block = (
+                        f"\n## 同类 {cls_name} 的其他成员函数（供跨函数分析参考）\n"
+                        + "\n".join(peer_lines)
+                    )
+
     # ── 构建完整 prompt ────────────────────────────────────────────────────
     return f"""\
 你是一个严格的 C++ 静态分析引擎。
@@ -330,7 +554,7 @@ def build_prompt(
    - 未改动的行不加任何前缀。
 
 待分析代码：
-{fa.func_code}{reference_block}"""
+{fa.func_code}{reference_block}{class_block}"""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -510,9 +734,11 @@ def main() -> None:
     func_code_cache: dict[str, str] = {}          # func_id → 函数源码
     func_callees: dict[str, set[str]] = {}        # func_id → 该函数内部调用的函数名集合
     global_functions: dict[str, str] = {}          # 纯函数名 → 函数源码（同名后者覆盖）
+    global_classes: dict[str, ClassInfo] = {}       # 类名 → 类信息（成员变量、方法列表）
+    func_class_map: dict[str, str] = {}             # func_id → 所属类名
 
     def _cache_functions(tree_root: Node, file_path_str: str) -> None:
-        """遍历 AST，缓存函数源码、被调用函数名，并更新全局函数映射。"""
+        """遍历 AST，缓存函数源码、被调用函数名，更新全局函数/类映射。"""
         for node in tree_root.children:
             _cache_functions(node, file_path_str)  # 先递归子节点
             if node.type == "function_definition":
@@ -531,6 +757,28 @@ def main() -> None:
                 if name not in ("(匿名函数)", "(全局作用域)"):
                     global_functions[name] = func_code
 
+                # ── 新增：检测类归属 ──
+                cls_name, _short, is_ctor, is_dtor = _resolve_method_class(node)
+                if cls_name and cls_name in global_classes:
+                    func_class_map[fid] = cls_name
+                    global_classes[cls_name].method_ids.append(fid)
+                    if is_ctor:
+                        global_classes[cls_name].ctor_ids.append(fid)
+                    if is_dtor:
+                        global_classes[cls_name].dtor_ids.append(fid)
+
+    # ── 第一趟：收集所有类定义（需先于函数缓存，因 .cpp 可能先于 .h 扫描）───
+    for file_path in source_files:
+        code = file_path.read_bytes()
+        tree = parser.parse(code)
+        file_classes = _collect_class_definitions(tree.root_node)
+        for cls_name, info in file_classes.items():
+            if cls_name not in global_classes:
+                global_classes[cls_name] = info
+            else:
+                global_classes[cls_name].member_vars.update(info.member_vars)
+
+    # ── 第二趟：收集内存操作 + 缓存函数信息 ──────────────────────────────────
     for file_path in source_files:
         console.print(f"[dim]  扫描: {file_path}[/dim]")
 
@@ -572,6 +820,9 @@ def main() -> None:
         else:
             current_fa.add_delete(op.row, op.var_name, op.op_text)
 
+    # ── 5.5 类级别跨函数合并（成员变量跨 ctor/dtor 配对）────────────────────
+    _merge_class_level_traces(analyses, global_classes)
+
     # ── 6. 打印摘要 ───────────────────────────────────────────────────────────
     total_new = sum(len(fa.new_ops) for fa in analyses)
     total_delete = sum(
@@ -592,7 +843,7 @@ def main() -> None:
                 label = {
                     "new": "[cyan]NEW  [/cyan]", "new[]": "[cyan]NEW[][/cyan]",
                     "delete": "[green]DEL  [/green]", "delete[]": "[green]DEL[][/green]",
-                }[op.op_type]
+                }.get(op.op_type, f"[dim]{op.op_type:7}[/dim]")
                 console.print(f"  {label} 第 {op.row} 行: {op.var_name} ({op.op_text})")
             for v in fa.leaked_vars:
                 console.print(f"  [yellow]  -> {v.var_name}: 可能泄漏（{v.alloc_count} alloc / {v.dealloc_count} dealloc）[/yellow]")
@@ -634,9 +885,22 @@ def main() -> None:
 
     # ── 打印安全函数 ──────────────────────────────────────────────────────────
     for fa in safe_funcs:
+        # 检测是否依赖跨函数配对（含虚拟 op）
+        has_cross = any(
+            op.op_text.startswith("(跨函数:")
+            for v in fa.variables.values()
+            for op in v.allocs + v.deallocs
+        )
+        tag = " [dim](跨函数配对确认)[/dim]" if has_cross else ""
+        real_allocs = len([op for op in fa.new_ops
+                           if not op.op_text.startswith("(跨函数:")])
+        real_deallocs = sum(
+            len([op for op in v.deallocs if not op.op_text.startswith("(跨函数:")])
+            for v in fa.variables.values()
+        )
         console.print(
-            f"[green][AST 静态确认安全] 函数 {fa.func_name} 内存闭环，无泄漏。"
-            f"（{len(fa.new_ops)} alloc / {sum(v.dealloc_count for v in fa.variables.values())} dealloc）[/green]"
+            f"[green][AST 静态确认安全] 函数 {fa.func_name} 内存闭环，无泄漏。{tag}"
+            f"（{real_allocs} alloc / {real_deallocs} dealloc）[/green]"
         )
     if safe_funcs:
         console.print()
@@ -671,7 +935,8 @@ def main() -> None:
     prompt_list: list[tuple[str, str]] = []
     for fa in needs_ai:
         prompt_list.append(
-            (fa.func_id, build_prompt(fa, global_functions, func_callees))
+            (fa.func_id, build_prompt(fa, global_functions, func_callees,
+                                      func_class_map, global_classes, func_code_cache))
         )
 
     total = len(prompt_list)
