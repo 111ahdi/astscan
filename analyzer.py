@@ -256,7 +256,7 @@ def collect_memory_ops(
 
     # 不加 else：new 内部可能嵌套 new / delete
     for child in node.children:
-        collect_memory_ops(child, ops)
+        collect_memory_ops(child, ops, file_path=file_path)
 
     return ops
 
