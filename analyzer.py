@@ -4,7 +4,7 @@
     python analyzer.py [target_file] [--collect-only]
 
 选项:
-    target_file      要分析的 C++ 文件路径（默认 test.cpp）
+    target_file      要分析的 C++ 文件或项目文件夹路径（默认当前目录 '.'）
     --collect-only   仅收集并打印分配点，不调用 AI
 """
 
@@ -195,11 +195,17 @@ def get_enclosing_function(node: Node) -> tuple[str | None, str, int]:
 def collect_memory_ops(
     node: Node,
     ops: list[tuple[str, MemoryOp]] | None = None,
+    file_path: str = "",
 ) -> list[tuple[str, MemoryOp]]:
     """递归遍历 AST，收集所有 new_expression 和 delete_expression。
 
+    参数:
+        node:      AST 根节点。
+        ops:       收集结果的列表（递归复用）。
+        file_path: 源文件路径，用于构造唯一 func_id 避免跨文件冲突。
+
     返回:
-        (func_id, MemoryOp) 列表，func_id 用于后续按函数分组。
+        (func_id, MemoryOp) 列表，func_id = "文件路径:函数名:起始行"。
     """
     if ops is None:
         ops = []
@@ -215,7 +221,9 @@ def collect_memory_ops(
         if func_code is None:
             func_code = "(无法定位所在函数)"
 
-        func_id = f"{func_name}:{func_start_row}" if func_name != "(全局作用域)" else "(全局作用域)"
+        # func_id 包含文件路径，确保跨文件唯一
+        scope = file_path if file_path else "(全局作用域)"
+        func_id = f"{scope}:{func_name}:{func_start_row}" if func_name != "(全局作用域)" else scope
 
         if node.type == "new_expression":
             op_type = "new[]" if "[" in op_text else "new"
@@ -441,10 +449,10 @@ def _parse_args() -> argparse.Namespace:
         description="C++ 静态分析工具 — 基于 tree-sitter + LLM 的内存泄漏检测",
     )
     parser.add_argument(
-        "target_file",
+        "target_path",
         nargs="?",
         default="test.cpp",
-        help="要分析的 C++ 文件路径（默认 test.cpp）",
+        help="要分析的 C++ 文件或项目文件夹路径（默认当前目录 '.'）",
     )
     parser.add_argument(
         "--collect-only",
@@ -452,6 +460,27 @@ def _parse_args() -> argparse.Namespace:
         help="仅收集并打印分配点，不调用 AI",
     )
     return parser.parse_args()
+
+
+def resolve_targets(target_path: str) -> list[Path]:
+    """将用户输入的路径解析为待分析文件列表。
+
+    - 文件 → 返回只含该文件的列表
+    - 目录 → 递归搜集所有 .cpp / .h / .hpp 文件
+    - 不存在 → 报错退出
+    """
+    path = Path(target_path)
+    if not path.exists():
+        console.print(f"[red]错误: 路径不存在 — {path}[/red]")
+        sys.exit(1)
+    if path.is_file():
+        return [path]
+
+    extensions = ("*.cpp", "*.cc", "*.cxx", "*.h", "*.hpp", "*.hh", "*.hxx")
+    files: list[Path] = []
+    for ext in extensions:
+        files.extend(path.rglob(ext))
+    return sorted(files)
 
 
 def main() -> None:
@@ -468,55 +497,58 @@ def main() -> None:
             )
             sys.exit(1)
 
-    # ── 2. 确定目标文件 ───────────────────────────────────────────────────────
-    target_file = Path(args.target_file)
-    if not target_file.exists():
-        console.print(f"[red]错误: 找不到文件 {target_file}[/red]")
-        sys.exit(1)
+    # ── 2. 解析目标文件列表 ───────────────────────────────────────────────────
+    source_files = resolve_targets(args.target_path)
+    console.print(f"[dim]共发现 {len(source_files)} 个源文件。[/dim]")
 
-    # ── 3. 初始化 C++ 解析器 ──────────────────────────────────────────────────
+    # ── 3. 初始化 C++ 解析器（只创建一次）─────────────────────────────────────
     lang = Language(tree_sitter_cpp.language())
     parser = Parser(lang)
 
-    # ── 4. 读取并解析源码 ─────────────────────────────────────────────────────
-    code = target_file.read_bytes()
-    tree = parser.parse(code)
+    # ── 4. 跨文件收集所有 new / delete 操作 ───────────────────────────────────
+    all_raw_ops: list[tuple[str, MemoryOp]] = []
+    # 缓存函数源码：key = func_id，value = func_code
+    func_code_cache: dict[str, str] = {}
 
-    # ── 5. 收集所有 new / delete 操作 ─────────────────────────────────────────
-    console.print(f"\n[bold]正在扫描: {target_file}[/bold]\n")
-    raw_ops = collect_memory_ops(tree.root_node)
+    for file_path in source_files:
+        console.print(f"[dim]  扫描: {file_path}[/dim]")
 
-    if not raw_ops:
+        # 读取并解析
+        code = file_path.read_bytes()
+        tree = parser.parse(code)
+
+        # 收集内存操作（file_path 确保跨文件 func_id 唯一）
+        file_ops = collect_memory_ops(tree.root_node, file_path=str(file_path))
+        all_raw_ops.extend(file_ops)
+
+        # 缓存该文件的函数源码
+        def _cache(node: Node) -> None:
+            if node.type == "function_definition":
+                name = _get_function_name(node)
+                start_row = node.start_point.row + 1
+                fid = f"{file_path}:{name}:{start_row}"
+                if fid not in func_code_cache:
+                    func_code_cache[fid] = node.text.decode() if node.text else ""
+            for child in node.children:
+                _cache(child)
+        _cache(tree.root_node)
+
+    if not all_raw_ops:
         console.print("[yellow]未发现任何 new / delete 表达式。[/yellow]")
         return
 
-    # ── 6. 填充 func_code 并构建 FunctionAnalysis ─────────────────────────────
-    # 重新遍历 AST 获取各函数的源码（比在收集阶段缓存更清晰）
-    _func_code_cache: dict[str, str] = {}
-
-    def _cache_func_codes(node: Node) -> None:
-        if node.type == "function_definition":
-            name = _get_function_name(node)
-            start_row = node.start_point.row + 1
-            fid = f"{name}:{start_row}"
-            if fid not in _func_code_cache:
-                _func_code_cache[fid] = node.text.decode() if node.text else ""
-        for child in node.children:
-            _cache_func_codes(child)
-
-    _cache_func_codes(tree.root_node)
-
-    # 构建 FunctionAnalysis 列表
-    raw_ops.sort(key=lambda x: x[0])
+    # ── 5. 构建 FunctionAnalysis 列表 ─────────────────────────────────────────
+    all_raw_ops.sort(key=lambda x: x[0])
     analyses: list[FunctionAnalysis] = []
     current_fa: FunctionAnalysis | None = None
     current_fid: str | None = None
 
-    for func_id, op in raw_ops:
+    for func_id, op in all_raw_ops:
         if func_id != current_fid:
-            parts = func_id.rsplit(":", 1)
-            func_name = parts[0]
-            func_code = _func_code_cache.get(func_id, "(无法定位所在函数)")
+            # func_id = "文件路径:函数名:起始行"
+            parts = func_id.rsplit(":", 2)       # 从右侧拆两次: 文件名, 函数名, 行号
+            func_name = parts[-2] if len(parts) >= 2 else func_id
+            func_code = func_code_cache.get(func_id, "(无法定位所在函数)")
             current_fa = FunctionAnalysis(
                 func_name=func_name,
                 func_code=func_code,
@@ -531,18 +563,19 @@ def main() -> None:
         else:
             current_fa.add_delete(op.row, op.var_name, op.op_text)
 
-    # ── 7. 打印摘要 ───────────────────────────────────────────────────────────
+    # ── 6. 打印摘要 ───────────────────────────────────────────────────────────
     total_new = sum(len(fa.new_ops) for fa in analyses)
     total_delete = sum(
         len([op for op in fa.all_ops if op.op_type in ("delete", "delete[]")])
         for fa in analyses
     )
     console.print(
-        f"[dim]发现 {total_new} 个 new / {total_delete} 个 delete，"
-        f"分布在 {len(analyses)} 个函数中。[/dim]\n"
+        f"\n[bold]分析完毕:[/bold] "
+        f"[dim]{len(source_files)} 个文件, {len(analyses)} 个函数, "
+        f"{total_new} 个 new / {total_delete} 个 delete。[/dim]\n"
     )
 
-    # ── 8. 仅收集模式 ─────────────────────────────────────────────────────────
+    # ── 7. 仅收集模式 ─────────────────────────────────────────────────────────
     if args.collect_only:
         for fa in analyses:
             console.print(f"[bold]函数: {fa.func_name}[/bold]")
@@ -552,9 +585,13 @@ def main() -> None:
                     "delete": "[green]DEL  [/green]", "delete[]": "[green]DEL[][/green]",
                 }[op.op_type]
                 console.print(f"  {label} 第 {op.row} 行: {op.var_name} ({op.op_text})")
-            # 泄漏快速判断
             for v in fa.leaked_vars:
                 console.print(f"  [yellow]  -> {v.var_name}: 可能泄漏（{v.alloc_count} alloc / {v.dealloc_count} dealloc）[/yellow]")
+            for v in fa.variables.values():
+                if v.has_mismatch and v.var_name != "?":
+                    console.print(
+                        f"  [red]  -> {v.var_name}: 交叉释放！（{v.allocs[0].op_type} / {v.deallocs[0].op_type}）[/red]"
+                    )
             for op in fa.orphan_deletes:
                 console.print(f"  [red]  -> {op.var_name}: 无对应 new 的释放！[/red]")
             console.print()
