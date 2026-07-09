@@ -12,6 +12,8 @@ import argparse
 import os
 import re
 import sys
+import yaml
+
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -33,8 +35,59 @@ load_dotenv()
 # ── Rich 控制台实例 ───────────────────────────────────────────────────────────
 console = Console()
 
-# ── 最大并发 API 调用数 ────────────────────────────────────────────────────────
-MAX_WORKERS = 3
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 配置加载
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """递归深度合并两个字典。override 中的值覆盖 base。"""
+    for key, value in override.items():
+        if key in base and isinstance(base[key], dict) and isinstance(value, dict):
+            _deep_merge(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+def load_config(config_path: str = "config/analyzer.yaml") -> dict:
+    """加载 YAML 配置文件，缺失字段回退到默认值。
+
+    若 PyYAML 不可用或配置文件不存在，静默使用默认配置。
+    """
+    defaults: dict = {
+        "scan": {
+            "exclude_dirs": ["build", "vendor", "out", ".git",
+                             "__pycache__", "node_modules"],
+            "extensions": [".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh", ".hxx"],
+        },
+        "ai": {
+            "model": "deepseek-v4-pro",
+            "base_url": "https://api.deepseek.com",
+            "timeout": 30,
+            "max_workers": 3,
+        },
+        "rules": {
+            "enable_cross_file_pairing": True,
+        },
+    }
+
+    path = Path(config_path)
+    if not path.exists():
+        return defaults
+
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            user_config = yaml.safe_load(fh) or {}
+    except Exception as exc:
+        console.print(f"[yellow]警告: 配置文件读取失败 ({exc})，使用默认配置。[/yellow]")
+        return defaults
+
+    return _deep_merge(defaults, user_config)
+
+
+# ── 全局配置实例（模块加载时解析）───────────────────────────────────────────────
+_CONFIG = load_config()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -174,6 +227,17 @@ def _find_identifier(node: Node) -> str:
     return "?"
 
 
+def _find_dtor_name(node: Node) -> Node | None:
+    """在子树中递归查找 destructor_name 节点。"""
+    if node.type == "destructor_name":
+        return node
+    for child in node.children:
+        result = _find_dtor_name(child)
+        if result:
+            return result
+    return None
+
+
 def _get_function_name(func_node: Node) -> str:
     """从 function_definition 节点中提取函数名。
 
@@ -181,19 +245,8 @@ def _get_function_name(func_node: Node) -> str:
     （如 int* func() 或 int& func()），需要递归查找。
     同时处理析构函数名（~ClassName）。
     """
-    def _find_dtor_name(node: Node) -> Node | None:
-        """在子树中递归查找 destructor_name 节点。"""
-        if node.type == "destructor_name":
-            return node
-        for child in node.children:
-            result = _find_dtor_name(child)
-            if result:
-                return result
-        return None
-
     def _search(node: Node) -> str:
         if node.type == "function_declarator":
-            # 优先检测析构函数（~ClassName）
             dtor = _find_dtor_name(node)
             if dtor:
                 ident = _find_identifier(dtor)
@@ -281,11 +334,9 @@ def _collect_class_definitions(tree_root: Node) -> dict[str, ClassInfo]:
 
         for child in body_node.children:
             if child.type == "field_declaration":
-                # 跳过函数声明（构造/析构/成员函数）
-                if any(c.type == "function_declarator"
-                       for c in child.children):
-                    pass  # 函数声明，不提取
-                else:
+                # 只提取变量声明，跳过函数声明（构造/析构/成员函数）
+                if not any(c.type == "function_declarator"
+                           for c in child.children):
                     decl = child.child_by_field_name("declarator")
                     if decl:
                         name = _find_field_name(decl)
@@ -476,8 +527,12 @@ def build_prompt(
     """
     lines: list[str] = []
 
+    # 缓存排序结果，避免 all_ops property 重复 sorted()
+    all_ops_sorted = fa.all_ops
+    new_ops_filtered = [op for op in all_ops_sorted if op.op_type in ("new", "new[]")]
+
     # ── 列出所有 new 操作 ──────────────────────────────────────────────────
-    for op in fa.new_ops:
+    for op in new_ops_filtered:
         if op.op_text.startswith("(跨函数:"):
             continue  # 虚拟操作（跨函数配对），不展示给 AI
         kind = "new[]" if op.op_type == "new[]" else "new"
@@ -487,14 +542,14 @@ def build_prompt(
             lines.append(f"- 第 {op.row} 行: **{kind}** 分配，(未绑定变量) (`{op.op_text}`)")
 
     # ── 列出所有 delete 操作 ───────────────────────────────────────────────
-    for op in fa.all_ops:
+    for op in all_ops_sorted:
         if op.op_type in ("delete", "delete[]"):
             if op.op_text.startswith("(跨函数:"):
                 continue  # 虚拟操作（跨函数配对），不展示给 AI
             lines.append(f"- 第 {op.row} 行: **{op.op_type}** 释放，变量 **{op.var_name}** (`{op.op_text}`)")
 
     # ── 汇总变量状态 ────────────────────────────────────────────────────────
-    named_all = [op.var_name for op in fa.new_ops if op.var_name != "?"]
+    named_all = [op.var_name for op in new_ops_filtered if op.var_name != "?"]
 
     if named_all:
         main_task = f"逐一判断指针 {'、'.join(named_all)} 是否存在内存泄漏。"
@@ -566,11 +621,12 @@ def analyze_with_ai(prompt: str, client: OpenAI) -> str:
 
     发生任何错误时打印警告并返回空字符串。
     """
+    ai_cfg = _CONFIG.get("ai", {})
     try:
         response = client.chat.completions.create(
-            model="deepseek-v4-pro",
+            model=ai_cfg.get("model", "deepseek-v4-pro"),
             messages=[{"role": "user", "content": prompt}],
-            timeout=30,
+            timeout=ai_cfg.get("timeout", 30),
         )
         content = response.choices[0].message.content
         return content if content else ""
@@ -641,13 +697,16 @@ def _render_diff_block(diff_text: str) -> Panel:
     return Panel(Text.from_markup("\n".join(styled_lines)), border_style="green")
 
 
+# 预编译正则：匹配 AI 返回的 diff 代码块
+_DIFF_RE = re.compile(r"```diff\n(.*?)```", re.DOTALL)
+
+
 def render_analysis(raw_text: str) -> Panel:
     """将 AI 返回的 Markdown 渲染为带颜色高亮的 Panel。"""
-    diff_pattern = re.compile(r"```diff\n(.*?)```", re.DOTALL)
     parts: list = []
     last_end = 0
 
-    for match in diff_pattern.finditer(raw_text):
+    for match in _DIFF_RE.finditer(raw_text):
         if match.start() > last_end:
             parts.append(_render_markdown_with_leak_highlight(
                 raw_text[last_end:match.start()]
@@ -690,7 +749,7 @@ def resolve_targets(target_path: str) -> list[Path]:
     """将用户输入的路径解析为待分析文件列表。
 
     - 文件 → 返回只含该文件的列表
-    - 目录 → 递归搜集所有 .cpp / .h / .hpp 文件
+    - 目录 → 递归搜集配置中指定的扩展名文件，排除配置的目录
     - 不存在 → 报错退出
     """
     path = Path(target_path)
@@ -700,10 +759,21 @@ def resolve_targets(target_path: str) -> list[Path]:
     if path.is_file():
         return [path]
 
-    extensions = ("*.cpp", "*.cc", "*.cxx", "*.h", "*.hpp", "*.hh", "*.hxx")
+    # 从配置读取扩展名和排除目录
+    scan_cfg = _CONFIG.get("scan", {})
+    ext_set = set(scan_cfg.get("extensions", [".cpp", ".h"]))
+    exclude_set = set(scan_cfg.get("exclude_dirs", []))
+
+    # 单次 walk + 后缀过滤，替代每个扩展名各 walk 一次
     files: list[Path] = []
-    for ext in extensions:
-        files.extend(path.rglob(ext))
+    for f in path.rglob("*"):
+        if not f.is_file():
+            continue
+        if f.suffix not in ext_set:
+            continue
+        if exclude_set and any(excl in f.parts for excl in exclude_set):
+            continue
+        files.append(f)
     return sorted(files)
 
 
@@ -768,9 +838,12 @@ def main() -> None:
                         global_classes[cls_name].dtor_ids.append(fid)
 
     # ── 第一趟：收集所有类定义（需先于函数缓存，因 .cpp 可能先于 .h 扫描）───
+    # 同时缓存解析树，避免第二趟重复 parse
+    parsed_trees: dict[str, object] = {}  # str(file_path) → tree_sitter.Tree
     for file_path in source_files:
         code = file_path.read_bytes()
         tree = parser.parse(code)
+        parsed_trees[str(file_path)] = tree
         file_classes = _collect_class_definitions(tree.root_node)
         for cls_name, info in file_classes.items():
             if cls_name not in global_classes:
@@ -778,12 +851,11 @@ def main() -> None:
             else:
                 global_classes[cls_name].member_vars.update(info.member_vars)
 
-    # ── 第二趟：收集内存操作 + 缓存函数信息 ──────────────────────────────────
+    # ── 第二趟：收集内存操作 + 缓存函数信息（复用第一趟的 Tree）──────────────
     for file_path in source_files:
         console.print(f"[dim]  扫描: {file_path}[/dim]")
 
-        code = file_path.read_bytes()
-        tree = parser.parse(code)
+        tree = parsed_trees[str(file_path)]
 
         file_ops = collect_memory_ops(tree.root_node, file_path=str(file_path))
         all_raw_ops.extend(file_ops)
@@ -821,7 +893,8 @@ def main() -> None:
             current_fa.add_delete(op.row, op.var_name, op.op_text)
 
     # ── 5.5 类级别跨函数合并（成员变量跨 ctor/dtor 配对）────────────────────
-    _merge_class_level_traces(analyses, global_classes)
+    if _CONFIG.get("rules", {}).get("enable_cross_file_pairing", True):
+        _merge_class_level_traces(analyses, global_classes)
 
     # ── 6. 打印摘要 ───────────────────────────────────────────────────────────
     total_new = sum(len(fa.new_ops) for fa in analyses)
@@ -927,9 +1000,10 @@ def main() -> None:
             console.print("[green]所有函数均为静态安全，无需 AI 分析。[/green]")
         return
 
+    ai_cfg = _CONFIG.get("ai", {})
     client = OpenAI(
         api_key=os.environ["DEEPSEEK_API_KEY"],
-        base_url="https://api.deepseek.com",
+        base_url=ai_cfg.get("base_url", "https://api.deepseek.com"),
     )
 
     prompt_list: list[tuple[str, str]] = []
@@ -951,7 +1025,7 @@ def main() -> None:
             f"[dim]正在调用 AI 分析 {total} 个函数…[/dim]", total=total
         )
 
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        with ThreadPoolExecutor(max_workers=ai_cfg.get("max_workers", 3)) as executor:
             future_map = {
                 executor.submit(analyze_with_ai, prompt, client): func_id
                 for func_id, prompt in prompt_list
